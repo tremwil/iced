@@ -20,6 +20,7 @@ pub(super) struct IpRelMemOpInstr {
 	eip_instruction_size: u8,
 	rip_instruction_size: u8,
 	target_instr: TargetInstr,
+	address_reg: Option<Register>,
 }
 
 impl IpRelMemOpInstr {
@@ -42,6 +43,7 @@ impl IpRelMemOpInstr {
 			eip_instruction_size,
 			rip_instruction_size,
 			target_instr: TargetInstr::default(),
+			address_reg: None,
 		}
 	}
 
@@ -76,8 +78,43 @@ impl IpRelMemOpInstr {
 			return true;
 		}
 
+		// Otherwise, the absolute address will have to be loaded into a register.
+		// To do this, we need a register that's safe to clobber.
+		self.address_reg = Self::find_clobberable_register(&self.instruction);
 		self.instr_kind = InstrKind::Long;
 		false
+	}
+
+	fn find_clobberable_register(instr: &Instruction) -> Option<Register> {
+		let mut instr_info = InstructionInfoFactory::new();
+		let info = instr_info.info_options(&instr, InstructionInfoOptions::NO_MEMORY_USAGE);
+
+		#[derive(Clone, Copy)]
+		struct CandidateRegInfo {
+			/// whether the full general purpose register is used by the instruction.
+			full_write: bool,
+			/// whether it's only ever written to.
+			write_only: bool,
+		}
+
+		// InstructionInfoFactory can return multiple UsedRegister entries for the same GPR.
+		// we need to group them by full register.
+		let mut candidates = [CandidateRegInfo { full_write: false, write_only: true, }; 16];
+		for used_gpr in info.used_registers().iter().filter(|r| r.register().is_gpr()) {
+			let full_register = used_gpr.register().full_register();
+			let candidate = &mut candidates[full_register as usize - Register::RAX as usize];
+
+			if used_gpr.access() != OpAccess::Write {
+				candidate.write_only = false;
+			}
+			// operations on 32-bit registers clear the high bits
+			else if used_gpr.register().size() >= 4 {
+				candidate.full_write = true;
+			}
+		}
+
+		let success_index = candidates.iter().position(|c| c.full_write && c.write_only)?;
+		Some(Register::from_u8(Register::RAX as u8 + success_index as u8))
 	}
 }
 
@@ -117,10 +154,32 @@ impl Instr for IpRelMemOpInstr {
 				}
 			}
 
-			InstrKind::Long => Err(IcedError::new(
-				"IP relative memory operand is too far away and isn't currently supported. \
-				 Try to allocate memory close to the original instruction (+/-2GB).",
-			)),
+			InstrKind::Long => {
+				if let Some(address_reg) = self.address_reg {
+					// note: unwrap here should never panic as `address_reg` was checked to be a 64-bit gpr
+					let mov = Instruction::with2(Code::Mov_r64_imm64, address_reg, self.instruction.memory_displacement64()).unwrap();
+					let mov_len =
+						ctx.block.encoder.encode(&mov, ctx.ip).map_err(|err| IcedError::with_string(InstrUtils::create_error_message(err, &mov)))?
+							as u32;
+
+					let reloc_addr = ctx.ip + ctx.block.encoder.get_constant_offsets().immediate_offset as u64;
+					ctx.block.add_reloc_info(RelocInfo { address: reloc_addr, kind: RelocKind::Offset64 });
+
+					self.instruction.set_memory_base(address_reg);
+					self.instruction.set_memory_index(Register::None);
+					self.instruction.set_memory_displacement64(0);
+
+					match ctx.block.encoder.encode(&self.instruction, ctx.ip + mov_len as u64) {
+						Ok(_) => Ok((ctx.block.encoder.get_constant_offsets(), true)),
+						Err(err) => Err(IcedError::with_string(InstrUtils::create_error_message(err, &self.instruction))),
+					}
+				} else {
+					Err(IcedError::new(
+						"IP relative memory operand is too far away and no register could be used to store the absolute address. \
+						Try to allocate memory close to the original instruction (+/-2GB).",
+					))
+				}
+			}
 
 			InstrKind::Uninitialized => unreachable!(),
 		}
